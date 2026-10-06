@@ -329,7 +329,7 @@ $BODY$
                 AND NOT bat.b_replayed
                 AND bat.i_id_source=p_i_id_source
             ORDER BY
-                bat.ts_created
+                bat.i_id_batch
             LIMIT 1
             )
         ;
@@ -499,6 +499,7 @@ $BODY$
                                 ON
                                         tab.v_table_name=log.v_table_name
                                     AND tab.v_schema_name=log.v_schema_name
+                                    AND tab.i_id_source=%L
                         WHERE
                                 tab.b_replica_enabled
                             AND i_id_event = ANY(%L)
@@ -531,7 +532,7 @@ $BODY$
             ORDER BY
                 i_id_event ASC
             ;
-        ',v_v_log_table,v_i_evt_replay);
+        ',v_v_log_table,p_i_id_source,v_i_evt_replay);
         RAISE DEBUG '%',v_t_main_sql;
         FOR v_r_statements IN EXECUTE v_t_main_sql
         LOOP
@@ -682,7 +683,7 @@ $BODY$
                 AND NOT bat.b_replayed
                 AND bat.i_id_source=p_i_id_source
             ORDER BY
-                bat.ts_created
+                bat.i_id_batch
             LIMIT 1
             )
         ;
@@ -895,4 +896,3 @@ WHERE
     AND con.contype='f'
 ) fk
 ;
-

@@ -15,7 +15,7 @@ from pg_chameleon.lib.pg_lib import pg_engine
 SID = '00000000-0000-0000-0000-000000000001'
 CONFIG = {'transactional_capture': True, 'gtid_enable': True, 'on_error_read': 'exit',
           'on_error_replay': 'exit', 'auto_maintenance': 'disabled',
-          'schema_mappings': {'source': 'public'}, 'limit_tables': [], 'skip_tables': []}
+          'schema_mappings': {'source': 'public'}, 'limit_tables': [], 'skip_tables': [], 'replay_max_rows': 1000}
 
 
 def make_engine(dsn):
@@ -53,10 +53,14 @@ class PublicationTest(unittest.TestCase):
                     "VALUES ('fixture','{\"source\":\"public\"}','mysql',ARRAY['t_log_replica','t_log_replica']) RETURNING i_id_source")
         cls.engine.i_id_source = cur.fetchone()[0]
         cls.engine.insert_source_timings()
+        cur.execute('CREATE TABLE public.items(id integer PRIMARY KEY)')
+        cur.execute("INSERT INTO sch_chameleon.t_replica_tables(i_id_source,v_table_name,v_schema_name,v_table_pkey) "
+                    "VALUES (%s,'items','public',ARRAY['id'])", (cls.engine.i_id_source,))
 
     def setUp(self):
         cur = self.engine.pgsql_cur
         cur.execute('TRUNCATE sch_chameleon.t_replica_batch CASCADE')
+        cur.execute('TRUNCATE public.items,sch_chameleon.t_error_log')
         cur.execute('DELETE FROM sch_chameleon.t_transaction_state')
         self.engine.bootstrap_transaction_state(SID, {'File': 'mysql-bin.000001', 'Position': 4,
                                                       'Executed_Gtid_Set': SID + ':1-3:7'})
@@ -159,8 +163,114 @@ class PublicationTest(unittest.TestCase):
             self.engine.create_replica_schema()
             with self.assertRaises(psycopg2.Error):
                 self.engine.get_transaction_state()
+            with self.assertRaises(psycopg2.Error):
+                self.engine.replay_replica()
         finally:
             self.engine.pgsql_cur.execute('ALTER VIEW sch_chameleon.v_feature_hidden RENAME TO v_betark_transactional_version')
+
+    def replay(self, max_rows=1000):
+        self.engine.pgsql_cur.execute('SELECT * FROM sch_chameleon.fn_replay_mysql(%s,%s,true)', (max_rows, self.engine.i_id_source))
+        return self.engine.pgsql_cur.fetchone()
+
+    def count(self):
+        self.engine.pgsql_cur.execute('SELECT count(*) FROM public.items')
+        return self.engine.pgsql_cur.fetchone()[0]
+
+    def test_complete_replay_rolls_back_and_retries(self):
+        cur = self.engine.pgsql_cur
+        cur.execute('ALTER TABLE public.items ADD CONSTRAINT reject_last CHECK(id<>1000)')
+        self.engine.publish_transaction(SID, self.transaction(rows=1001))
+        next_tx = self.transaction(number=10, rows=1)
+        next_tx['rows'][0]['event_after']['id'] = 2000
+        self.engine.publish_transaction(SID, next_tx)
+        queued = self.queue()
+        before = self.engine.get_transaction_state()
+        try:
+            status = self.replay()
+            self.assertEqual(self.count(), 0, 'Partial source transaction was committed')
+            self.assertTrue(status[1], 'Replay did not reach failing last row')
+            self.assertEqual(self.queue(), queued)
+            self.assertEqual(self.engine.get_transaction_state(), before)
+        finally:
+            cur.execute('ALTER TABLE public.items DROP CONSTRAINT reject_last')
+        self.assertFalse(self.replay()[1])
+        self.assertEqual(self.count(), 1001)
+        self.assertEqual(len(self.queue()), 1)  # Neighbour not replayed by this call.
+        self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9')
+        self.assertFalse(self.replay()[1])
+        self.assertEqual(self.count(), 1002)
+        self.assertEqual(self.queue(), [])
+        self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9-10')
+
+    def test_empty_replay_advances_applied_frontier(self):
+        self.engine.publish_transaction(SID, self.transaction(rows=0))
+        self.assertFalse(self.replay()[1])
+        self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9')
+        self.assertEqual(self.queue(), [])
+
+    def test_applied_gtid_survives_batch_retention(self):
+        self.engine.publish_transaction(SID, self.transaction())
+        self.assertFalse(self.replay()[1])
+        self.engine.pgsql_cur.execute('DELETE FROM sch_chameleon.t_replica_batch WHERE b_replayed')
+        self.assertFalse(self.engine.publish_transaction(SID, self.transaction()))
+        self.assertEqual(self.count(), 2)
+        self.assertEqual(self.queue(), [])
+        self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9')
+
+    def test_two_replayers_serialize(self):
+        self.engine.publish_transaction(SID, self.transaction(rows=1001))
+        def replay():
+            conn = psycopg2.connect(self.dsn)
+            conn.autocommit = True
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT * FROM sch_chameleon.fn_replay_mysql(1000,%s,true)', (self.engine.i_id_source,))
+                    return cur.fetchone()
+            finally:
+                conn.close()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            statuses = list(pool.map(lambda _: replay(), range(2)))
+        self.assertTrue(all(not status[1] for status in statuses))
+        self.assertEqual(self.count(), 1001)
+        self.assertEqual(self.queue(), [])
+
+    def test_migration_replay_forbids_skip_errors(self):
+        with self.assertRaises(psycopg2.Error):
+            self.engine.pgsql_cur.execute('SELECT * FROM sch_chameleon.fn_replay_mysql(1000,%s,false)', (self.engine.i_id_source,))
+
+    def test_mode_cannot_be_disabled_against_migration_frontier(self):
+        self.engine.publish_transaction(SID, self.transaction())
+        self.engine.sources['fixture']['transactional_capture'] = False
+        try:
+            with self.assertRaises(ValueError):
+                self.engine.replay_replica()
+        finally:
+            self.engine.sources['fixture']['transactional_capture'] = True
+        self.assertEqual(self.count(), 0)
+
+    def test_legacy_replay_still_uses_one_budget(self):
+        cur = self.engine.pgsql_cur
+        cur.execute("INSERT INTO sch_chameleon.t_sources(t_source,jsb_schema_mappings,enm_source_type,v_log_table) "
+                    "VALUES ('legacy','{}','mysql',ARRAY['t_log_replica','t_log_replica']) RETURNING i_id_source")
+        other = cur.fetchone()[0]
+        try:
+            cur.execute("INSERT INTO sch_chameleon.t_replica_tables(i_id_source,v_table_name,v_schema_name,v_table_pkey) "
+                        "VALUES (%s,'items','public',ARRAY['id'])", (other,))
+            cur.execute("INSERT INTO sch_chameleon.t_replica_batch(i_id_source,b_started,v_log_table) "
+                        "VALUES (%s,true,'t_log_replica') RETURNING i_id_batch", (other,))
+            batch = cur.fetchone()[0]
+            rows = self.transaction()['rows']
+            for row in rows:
+                row['global_data'].update(batch_id=batch, log_table='t_log_replica')
+            self.engine.write_batch(rows)  # Legacy API, no new strict parameter required.
+            self.engine.set_batch_processed(batch)
+            cur.execute('SELECT * FROM sch_chameleon.fn_replay_mysql(1,%s,true)', (other,))
+            self.assertFalse(cur.fetchone()[1])
+            self.assertEqual(self.count(), 1)
+            cur.execute('SELECT cardinality(i_id_event) FROM sch_chameleon.t_batch_events WHERE i_id_batch=%s', (batch,))
+            self.assertEqual(cur.fetchone(), (1,))
+        finally:
+            cur.execute('DELETE FROM sch_chameleon.t_sources WHERE i_id_source=%s', (other,))
 
 
 if __name__ == '__main__':

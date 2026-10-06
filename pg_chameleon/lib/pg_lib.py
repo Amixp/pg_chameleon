@@ -739,6 +739,15 @@ class pg_engine(object):
             raise ValueError('Source selection/type configuration changed after initial load')
         return state
 
+    def check_transaction_mode(self):
+        if self.transactional_capture():
+            return self.get_transaction_state()
+        self.pgsql_cur.execute("SELECT to_regclass('sch_chameleon.t_transaction_state')")
+        if self.pgsql_cur.fetchone()[0] is not None:
+            self.pgsql_cur.execute('SELECT 1 FROM sch_chameleon.t_transaction_state WHERE i_id_source=%s', (self.i_id_source,))
+            if self.pgsql_cur.fetchone():
+                raise ValueError('Cannot disable transactional mode against an existing migration frontier')
+
     def bootstrap_transaction_state(self, source_uuid, coordinates):
         """Only called after a successful new initial load; never from reader restart."""
         from pymysqlreplication.gtid import GtidSet
@@ -1359,6 +1368,7 @@ class pg_engine(object):
 
         """
         tables_error = []
+        self.check_transaction_mode()
         replica_paused = self.get_replica_paused()
         if replica_paused:
             self.logger.info("Replay replica is paused")

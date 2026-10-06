@@ -1578,6 +1578,7 @@ class mysql_source(object):
         if skip:
             self.logger.warning("Couldn't connect to the source database for reading the replica. Ignoring.")
         else:
+            self.pg_engine.check_transaction_mode()
             self.pg_engine.set_source_status("running")
             replica_paused = self.pg_engine.get_replica_paused()
             if replica_paused:

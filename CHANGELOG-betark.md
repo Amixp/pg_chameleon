@@ -1,5 +1,17 @@
 # Изменения Betark
 
+## 2026-10-07 — атомарный replay source transaction (не release)
+
+- Native replay wrapper переиспользует upstream SQL generator, но применяет
+  полный выбранный batch, queue mutations и applied frontier одним commit.
+- Ошибка строки 1001 откатывает все предыдущие 1000 строк. Снятие CHECK и
+  повтор применяют 1001 строку без manual queue edits; соседний batch не обгоняет.
+- Порядок определяется batch/event IDs; SQL join metadata ограничен source ID.
+- Empty transactions, два replayer, frontier после batch retention и legacy
+  однократный replay budget проверяются native PostgreSQL тестами.
+- Отключение transactional mode при существующем frontier запрещено до DML.
+- Nine-hypertable/crash/HA admission и release ещё не выполнены.
+
 ## 2026-10-07 — capture и атомарная публикация (не release)
 
 - Форк от upstream v2.0.21 / `5458575165565b4593d33af912e7fdbeb4db49f8`.
