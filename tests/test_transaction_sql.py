@@ -1,8 +1,10 @@
 """Native PostgreSQL tests. Run via run-transaction-sql.py, never production."""
 import logging
+import multiprocessing
 import os
 from pathlib import Path
 import re
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -18,17 +20,78 @@ CONFIG = {'transactional_capture': True, 'gtid_enable': True, 'on_error_read': '
           'schema_mappings': {'source': 'public'}, 'limit_tables': [], 'skip_tables': [], 'replay_max_rows': 1000}
 
 
-def make_engine(dsn):
+def make_engine(dsn, connection_factory=None):
     engine = pg_engine()
     engine.logger = logging.getLogger('transaction-tests')
     engine.sources = {'fixture': dict(CONFIG)}
     engine.source = 'fixture'
     engine.type_override = None
-    engine.pgsql_conn = psycopg2.connect(dsn)
+    engine.pgsql_conn = psycopg2.connect(dsn, connection_factory=connection_factory)
     engine.pgsql_conn.autocommit = True
     engine.pgsql_cur = engine.pgsql_conn.cursor()
     engine.dest_conn = {'database': parse_dsn(dsn)['dbname']}
     return engine
+
+
+class FaultConnection(psycopg2.extensions.connection):
+    """Test-only barrier/lost response, always using the real PostgreSQL commit."""
+    phase = None
+    pipe = None
+    lose_ack = False
+
+    def pause(self, phase):
+        if self.phase == phase:
+            self.pipe.send(('barrier', phase))
+            self.pipe.recv()
+
+    def commit(self):
+        self.pause('before_commit')
+        super().commit()
+        self.pause('after_commit')
+        if self.lose_ack:
+            self.close()
+            raise psycopg2.OperationalError('synthetic lost commit response')
+
+
+class FaultCursor(psycopg2.extensions.cursor):
+    def execute(self, query, vars=None):
+        result = super().execute(query, vars)
+        if isinstance(query, str) and query.startswith('INSERT INTO sch_chameleon.t_batch_events '):
+            self.connection.pause('after_queue')
+        return result
+
+
+def publication_worker(dsn, transaction, phase, pipe):
+    engine = make_engine(dsn, FaultConnection)
+    engine.pgsql_cur.close()
+    engine.pgsql_cur = engine.pgsql_conn.cursor(cursor_factory=FaultCursor)
+    engine.pgsql_conn.phase, engine.pgsql_conn.pipe = phase, pipe
+    write = engine.write_batch
+
+    def paused_write(*args, **kwargs):
+        engine.pgsql_conn.pause('before_copy')
+        write(*args, **kwargs)
+        engine.pgsql_conn.pause('after_copy')
+
+    with mock.patch.object(engine, 'write_batch', side_effect=paused_write):
+        engine.publish_transaction(SID, transaction)
+    engine.disconnect_db()
+
+
+def replay_worker(dsn, source_id, pipe):
+    conn = psycopg2.connect(dsn)
+    try:
+        pipe.send(('backend', conn.get_backend_pid()))
+        pipe.recv()
+        with conn.cursor() as cur:
+            cur.execute('SELECT * FROM sch_chameleon.fn_replay_mysql(1000,%s,true)', (source_id,))
+            status = cur.fetchone()
+        conn.commit()
+        pipe.send(('done', status))
+    except psycopg2.Error as error:
+        pipe.send(('error', error.pgcode))
+    finally:
+        conn.close()
 
 
 class PublicationTest(unittest.TestCase):
@@ -226,6 +289,187 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(self.count(), 2)
         self.assertEqual(self.queue(), [])
         self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9')
+
+    def test_publication_process_crashes_and_restart(self):
+        context = multiprocessing.get_context('spawn')
+        for phase in ('before_copy', 'after_copy', 'after_queue', 'before_commit', 'after_commit'):
+            with self.subTest(phase=phase):
+                self.setUp()
+                before = self.engine.get_transaction_state()
+                tx = self.transaction(rows=1001)
+                parent, child = context.Pipe()
+                process = context.Process(target=publication_worker, args=(self.dsn, tx, phase, child))
+                process.start()
+                child.close()
+                try:
+                    self.assertTrue(parent.poll(15), 'Worker did not reach barrier')
+                    self.assertEqual(parent.recv(), ('barrier', phase))
+                    if phase == 'after_commit':
+                        self.assertEqual(len(self.queue()), 1)
+                        self.assertEqual(len(self.queue()[0][1]), 1001)
+                    else:
+                        self.assertEqual(self.queue(), [])
+                        self.assertEqual(self.engine.get_transaction_state(), before)
+                    process.kill()  # Only the worker created by this test.
+                    process.join(10)
+                    self.assertFalse(process.is_alive())
+                    restarted = make_engine(self.dsn)
+                    try:
+                        self.assertEqual(restarted.publish_transaction(SID, tx), phase != 'after_commit')
+                        self.assertFalse(restarted.publish_transaction(SID, tx))
+                    finally:
+                        restarted.disconnect_db()
+                    self.assertEqual(len(self.queue()), 1)
+                    self.assertEqual(len(self.queue()[0][1]), 1001)
+                    self.assertEqual(self.engine.get_transaction_state()['capture_gtid_set'], SID + ':1-3:7:9')
+                    self.assertFalse(self.replay()[1])
+                    self.assertEqual(self.count(), 1001)
+                finally:
+                    if process.is_alive():
+                        process.kill()
+                    process.join(10)
+                    parent.close()
+
+    def test_publication_lost_commit_response_uses_durable_frontier(self):
+        fault = make_engine(self.dsn, FaultConnection)
+        fault.pgsql_conn.lose_ack = True
+        tx = self.transaction(rows=1001)
+        try:
+            with self.assertRaisesRegex(psycopg2.OperationalError, 'lost commit response'):
+                fault.publish_transaction(SID, tx)
+        finally:
+            fault.pgsql_conn.close()
+        self.assertEqual(len(self.queue()), 1)
+        self.assertFalse(self.engine.publish_transaction(SID, tx))
+        self.assertFalse(self.replay()[1])
+        self.engine.pgsql_cur.execute('DELETE FROM sch_chameleon.t_replica_batch WHERE b_replayed')
+        self.assertFalse(self.engine.publish_transaction(SID, tx))
+        self.assertEqual(self.count(), 1001)
+        self.assertEqual(self.queue(), [])
+
+    def test_replay_lost_commit_response_is_complete_and_not_reapplied(self):
+        self.engine.publish_transaction(SID, self.transaction(rows=1001))
+        conn = psycopg2.connect(self.dsn, connection_factory=FaultConnection)
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT * FROM sch_chameleon.fn_replay_mysql(1000,%s,true)', (self.engine.i_id_source,))
+                self.assertFalse(cur.fetchone()[1])
+            # A separate READ COMMITTED observer sees no uncommitted rows/checkpoint.
+            self.assertEqual(self.count(), 0)
+            self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7')
+            self.assertEqual(len(self.queue()[0][1]), 1001)
+            conn.lose_ack = True
+            with self.assertRaisesRegex(psycopg2.OperationalError, 'lost commit response'):
+                conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.count(), 1001)
+        self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9')
+        self.assertEqual(self.queue(), [])
+        self.assertFalse(self.replay()[1])
+        self.assertEqual(self.count(), 1001)
+
+    def wait_backend_lock(self, pid):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            self.engine.pgsql_cur.execute('SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s', (pid,))
+            if self.engine.pgsql_cur.fetchone() == ('Lock',):
+                return
+            time.sleep(0.05)
+        self.fail('Replay did not reach native lock barrier')
+
+    def start_replay_worker(self):
+        parent, child = multiprocessing.get_context('spawn').Pipe()
+        process = multiprocessing.get_context('spawn').Process(
+            target=replay_worker, args=(self.dsn, self.engine.i_id_source, child))
+        process.start()
+        child.close()
+        self.assertTrue(parent.poll(15))
+        kind, pid = parent.recv()
+        self.assertEqual(kind, 'backend')
+        parent.send('run')
+        self.addCleanup(parent.close)
+        def stop():
+            if process.is_alive():
+                process.kill()
+            process.join(10)
+        self.addCleanup(stop)
+        return process, parent, pid
+
+    def test_replay_connection_failure_rolls_back_partial_work(self):
+        cur = self.engine.pgsql_cur
+        cur.execute('CREATE FUNCTION public.cdc_test_pause() RETURNS trigger LANGUAGE plpgsql AS $$ '
+                    'BEGIN IF NEW.id=1000 THEN PERFORM pg_advisory_xact_lock(823719); END IF; RETURN NEW; END $$')
+        cur.execute('CREATE TRIGGER cdc_test_pause BEFORE INSERT ON public.items '
+                    'FOR EACH ROW EXECUTE FUNCTION public.cdc_test_pause()')
+        blocker = psycopg2.connect(self.dsn)
+        try:
+            with blocker.cursor() as lock:
+                lock.execute('SELECT pg_advisory_xact_lock(823719)')
+            self.engine.publish_transaction(SID, self.transaction(rows=1001))
+            before, queue = self.engine.get_transaction_state(), self.queue()
+            process, pipe, pid = self.start_replay_worker()
+            self.wait_backend_lock(pid)
+            self.assertEqual(self.count(), 0)
+            cur.execute('SELECT pg_terminate_backend(%s)', (pid,))  # Exact fixture worker backend.
+            self.assertEqual(cur.fetchone(), (True,))
+            self.assertTrue(pipe.poll(15))
+            self.assertEqual(pipe.recv()[0], 'error')
+            process.join(10)
+            self.assertEqual(self.count(), 0)
+            self.assertEqual(self.queue(), queue)
+            self.assertEqual(self.engine.get_transaction_state(), before)
+        finally:
+            blocker.close()
+            cur.execute('DROP TRIGGER cdc_test_pause ON public.items')
+            cur.execute('DROP FUNCTION public.cdc_test_pause()')
+        self.assertFalse(self.replay()[1])
+        self.assertEqual(self.count(), 1001)
+
+    def test_real_deadlock_never_skips_or_commits_partial_transaction(self):
+        cur = self.engine.pgsql_cur
+        cur.execute('INSERT INTO public.items VALUES(0),(1)')
+        tx = self.transaction()
+        for row in tx['rows']:
+            row['global_data']['action'] = 'delete'
+            # Upstream DeleteRowsEvent.values lives in event_after (not before).
+        self.engine.publish_transaction(SID, tx)
+        before, queue = self.engine.get_transaction_state(), self.queue()
+        writer = psycopg2.connect(self.dsn)
+        try:
+            with writer.cursor() as lock:
+                lock.execute('SET statement_timeout=15000')
+                lock.execute('SELECT id FROM public.items WHERE id=1 FOR UPDATE')
+                process, pipe, pid = self.start_replay_worker()
+                self.wait_backend_lock(pid)
+                self.assertEqual(self.count(), 2)  # First DELETE remains invisible.
+                def contend():
+                    try:
+                        lock.execute('SELECT id FROM public.items WHERE id=0 FOR UPDATE')
+                    except psycopg2.errors.DeadlockDetected:
+                        return 'writer_victim'
+                    finally:
+                        writer.rollback()
+                    return 'replay_victim'
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    victim = pool.submit(contend).result(timeout=20)
+                self.assertTrue(pipe.poll(15))
+                kind, status = pipe.recv()
+                self.assertEqual(kind, 'done')
+                process.join(10)
+                if victim == 'replay_victim':
+                    self.assertTrue(status[1])
+                    self.assertEqual(self.count(), 2)
+                    self.assertEqual(self.queue(), queue)
+                    self.assertEqual(self.engine.get_transaction_state(), before)
+                    self.assertFalse(self.replay()[1])
+                else:
+                    self.assertFalse(status[1])
+                self.assertEqual(self.count(), 0)
+                self.assertEqual(self.queue(), [])
+                self.assertEqual(self.engine.get_transaction_state()['applied_gtid_set'], SID + ':1-3:7:9')
+        finally:
+            writer.close()
 
     def test_two_replayers_serialize(self):
         self.engine.publish_transaction(SID, self.transaction(rows=1001))

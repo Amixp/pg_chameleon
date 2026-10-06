@@ -1,5 +1,18 @@
 # Изменения Betark
 
+## 2026-10-07 — crash/restart и потеря commit response (candidate)
+
+- Сохранены реальные PG16 тесты остановки только собственного worker до/после
+  COPY, после queue, до commit и после commit. Restart публикует ровно один batch.
+- Capture и replay lost-ACK вызывают настоящий commit, затем закрывают connection:
+  durable GTID/frontier предотвращают повтор, в том числе после batch retention.
+- READ COMMITTED observer не видит частичные DML/checkpoint; termination точного
+  fixture backend на строке 1001 откатывает все строки и сохраняет очередь.
+- Реальный двухсторонний PostgreSQL deadlock не подтверждает/не пропускает
+  неуспешную транзакцию. Retry не требует удаления queue или правки позиции.
+- 42 synthetic/native tests PASS. Fault hooks существуют только в tests,
+  production API не изменён. Release/full rehearsal/HA admission ещё не выполнены.
+
 ## 2026-10-07 — native Timescale/bytea gate (candidate, не release)
 
 - COPY/CDC сохраняют SQL NULL, empty bytea, NUL/0xff и реальные bytes, включая
