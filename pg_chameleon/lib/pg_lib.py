@@ -708,6 +708,155 @@ class pg_engine(object):
         self.logger.debug("Disabling the lock timeout for the session." )
         self.pgsql_cur.execute("SET LOCK_TIMEOUT ='0';")
 
+    def transactional_capture(self):
+        return self.sources[self.source].get('transactional_capture', False)
+
+    def transaction_config_fingerprint(self):
+        import hashlib
+        from pg_chameleon.lib.transaction import TransactionBuffer
+        config = self.sources[self.source]
+        if (config.get('transactional_capture') is not True or config.get('gtid_enable') is not True
+                or config.get('on_error_read') != 'exit' or config.get('on_error_replay') != 'exit'
+                or config.get('auto_maintenance') != 'disabled'):
+            raise ValueError('Transactional migration requires GTID and fail-closed configuration')
+        TransactionBuffer(config.get('transaction_max_rows', 100000), config.get('transaction_max_bytes', 268435456))
+        selection = {key: config.get(key) for key in
+                     ('schema_mappings', 'limit_tables', 'skip_tables', 'skip_events', 'transactional_capture')}
+        selection['type_override'] = self.type_override
+        return hashlib.sha256(json.dumps(selection, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+    def get_transaction_state(self):
+        fingerprint = self.transaction_config_fingerprint()
+        self.pgsql_cur.execute('SELECT version FROM sch_chameleon.v_betark_transactional_version')
+        if self.pgsql_cur.fetchone() != (1,):
+            raise ValueError('Incompatible transactional catalogue')
+        self.pgsql_cur.execute('SELECT * FROM sch_chameleon.t_transaction_state WHERE i_id_source=%s', (self.i_id_source,))
+        row = self.pgsql_cur.fetchone()
+        if row is None:
+            raise ValueError('No successful initial-load transaction frontier')
+        state = dict(zip((column[0] for column in self.pgsql_cur.description), row))
+        if state['config_fingerprint'] != fingerprint:
+            raise ValueError('Source selection/type configuration changed after initial load')
+        return state
+
+    def bootstrap_transaction_state(self, source_uuid, coordinates):
+        """Only called after a successful new initial load; never from reader restart."""
+        from pymysqlreplication.gtid import GtidSet
+        from uuid import UUID
+        fingerprint = self.transaction_config_fingerprint()
+        source_uuid = str(UUID(source_uuid))
+        captured = str(GtidSet(coordinates['Executed_Gtid_Set']))
+        if not coordinates['File'] or type(coordinates['Position']) is not int or coordinates['Position'] <= 0:
+            raise ValueError('Invalid initial-load coordinates')
+        connection = self.pgsql_conn
+        connection.autocommit = False
+        try:
+            self.pgsql_cur.execute('SELECT i_id_source FROM sch_chameleon.t_sources WHERE i_id_source=%s FOR UPDATE', (self.i_id_source,))
+            if self.pgsql_cur.fetchone() is None:
+                raise ValueError('Source missing')
+            self.pgsql_cur.execute('SELECT 1 FROM sch_chameleon.t_transaction_state WHERE i_id_source=%s', (self.i_id_source,))
+            if self.pgsql_cur.fetchone():
+                raise ValueError('Initial-load frontier already exists; refusing reinitialisation')
+            self.pgsql_cur.execute('SELECT 1 FROM sch_chameleon.t_log_replica log JOIN sch_chameleon.t_replica_batch bat USING(i_id_batch) WHERE bat.i_id_source=%s LIMIT 1', (self.i_id_source,))
+            if self.pgsql_cur.fetchone():
+                raise ValueError('Cannot bootstrap a partially captured source')
+            self.pgsql_cur.execute('INSERT INTO sch_chameleon.t_transaction_state VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                                   (self.i_id_source, source_uuid, fingerprint, coordinates['File'], coordinates['Position'], captured,
+                                    coordinates['File'], coordinates['Position'], captured))
+            self.pgsql_cur.execute('UPDATE sch_chameleon.t_replica_batch SET b_started=true,b_processed=true,b_replayed=true '
+                                   'WHERE i_id_source=%s', (self.i_id_source,))
+            self.pgsql_cur.execute('DELETE FROM sch_chameleon.t_batch_events WHERE i_id_batch IN '
+                                   '(SELECT i_id_batch FROM sch_chameleon.t_replica_batch WHERE i_id_source=%s)', (self.i_id_source,))
+            self.pgsql_cur.execute('INSERT INTO sch_chameleon.t_replica_batch(i_id_source,v_log_table,t_gtid_set) '
+                                   'SELECT i_id_source,v_log_table[1],%s FROM sch_chameleon.t_sources WHERE i_id_source=%s',
+                                   (captured, self.i_id_source))
+            connection.commit()
+        except BaseException:
+            if not connection.closed:
+                connection.rollback()
+            raise
+        finally:
+            if not connection.closed:
+                connection.autocommit = True
+
+    def assert_new_transaction_source(self):
+        self.transaction_config_fingerprint()
+        self.pgsql_cur.execute('SELECT enm_status FROM sch_chameleon.t_sources WHERE i_id_source=%s', (self.i_id_source,))
+        if self.pgsql_cur.fetchone() != ('ready',):
+            raise ValueError('Initial load requires a new ready source, never a retry/working source')
+        self.pgsql_cur.execute('SELECT 1 FROM sch_chameleon.t_transaction_state WHERE i_id_source=%s', (self.i_id_source,))
+        if self.pgsql_cur.fetchone():
+            raise ValueError('Existing frontier; refusing initial-load cleanup/truncate')
+        self.pgsql_cur.execute('SELECT 1 FROM sch_chameleon.t_replica_tables WHERE i_id_source=%s LIMIT 1', (self.i_id_source,))
+        if self.pgsql_cur.fetchone():
+            raise ValueError('Existing replica tables; refusing partial initial-load retry')
+
+    def publish_transaction(self, source_uuid, transaction):
+        """COPY, complete queue, metadata and durable capture frontier: one commit."""
+        from pymysqlreplication.gtid import Gtid, GtidSet
+        from pg_chameleon.lib.transaction import TransactionBuffer, merge_committed_gtid
+        from uuid import UUID
+        source_uuid = str(UUID(source_uuid))
+        config = self.sources[self.source]
+        buffer = TransactionBuffer(config.get('transaction_max_rows', 100000), config.get('transaction_max_bytes', 268435456))
+        buffer.begin(transaction['gtid'])
+        for row in transaction['rows']:
+            if row['global_data']['action'] not in ('insert', 'update', 'delete'):
+                raise ValueError('DDL/unsupported event in transactional migration')
+            buffer.append(row)
+        transaction = buffer.commit(transaction['commit'])
+        connection = self.pgsql_conn
+        connection.autocommit = False
+        try:
+            self.pgsql_cur.execute('SELECT i_id_source FROM sch_chameleon.t_sources WHERE i_id_source=%s FOR UPDATE', (self.i_id_source,))
+            self.pgsql_cur.execute('SELECT i_id_source FROM sch_chameleon.t_transaction_state WHERE i_id_source=%s FOR UPDATE', (self.i_id_source,))
+            state = self.get_transaction_state()
+            if state['source_uuid'] != source_uuid:
+                raise ValueError('Source identity changed')
+            if Gtid(transaction['gtid']) in GtidSet(state['capture_gtid_set']):
+                connection.rollback()
+                return False
+            captured = merge_committed_gtid(state['capture_gtid_set'], transaction['gtid'])
+            coordinates = transaction['commit']
+            if (coordinates['File'], coordinates['Position']) <= (state['capture_file'], state['capture_position']):
+                raise ValueError('Commit coordinates moved backwards')
+            self.pgsql_cur.execute('SELECT i_id_batch,v_log_table FROM sch_chameleon.t_replica_batch '
+                                   'WHERE i_id_source=%s AND NOT b_processed AND t_source_gtid IS NULL ORDER BY i_id_batch FOR UPDATE',
+                                   (self.i_id_source,))
+            placeholders = self.pgsql_cur.fetchall()
+            if len(placeholders) != 1:
+                raise ValueError('Expected exactly one empty capture placeholder')
+            batch_id, log_table = placeholders[0]
+            self.pgsql_cur.execute('UPDATE sch_chameleon.t_replica_batch SET b_started=true,b_processed=true,ts_processed=clock_timestamp(),'
+                                   't_binlog_name=%s,i_binlog_position=%s,t_gtid_set=%s,t_source_uuid=%s,t_source_gtid=%s WHERE i_id_batch=%s',
+                                   (coordinates['File'], coordinates['Position'], captured, source_uuid, transaction['gtid'], batch_id))
+            rows = [dict(row, global_data=dict(row['global_data'], batch_id=batch_id, log_table=log_table))
+                    for row in transaction['rows']]
+            if rows:
+                self.write_batch(rows, strict=True)
+            self.pgsql_cur.execute('INSERT INTO sch_chameleon.t_batch_events '
+                                   'SELECT %s,coalesce(array_agg(i_id_event ORDER BY i_id_event),ARRAY[]::bigint[]) '
+                                   'FROM sch_chameleon.t_log_replica WHERE i_id_batch=%s', (batch_id, batch_id))
+            for row in rows:
+                if row['global_data'].get('consistent_table'):
+                    self.set_consistent_table(row['global_data']['table'], row['global_data']['schema'])
+            self.pgsql_cur.execute('UPDATE sch_chameleon.t_transaction_state SET capture_file=%s,capture_position=%s,capture_gtid_set=%s '
+                                   'WHERE i_id_source=%s', (coordinates['File'], coordinates['Position'], captured, self.i_id_source))
+            self.pgsql_cur.execute('UPDATE sch_chameleon.t_last_received SET ts_last_received=to_timestamp(%s) WHERE i_id_source=%s',
+                                   (coordinates['Time'], self.i_id_source))
+            next_log = self.swap_source_log_table()
+            self.pgsql_cur.execute('INSERT INTO sch_chameleon.t_replica_batch(i_id_source,v_log_table,t_gtid_set) VALUES(%s,%s,%s)',
+                                   (self.i_id_source, next_log, captured))
+            connection.commit()
+            return True
+        except BaseException:
+            if not connection.closed:
+                connection.rollback()
+            raise
+        finally:
+            if not connection.closed:
+                connection.autocommit = True
+
     def create_replica_schema(self):
         """
             The method installs the replica schema sch_chameleon if not already  present.
@@ -720,6 +869,9 @@ class pg_engine(object):
             file_schema = open(self.sql_dir+"create_schema.sql", 'rb')
             sql_schema = file_schema.read()
             file_schema.close()
+            if any(config.get('transactional_capture') for config in self.sources.values()):
+                with open(self.sql_dir + 'betark_transactional.sql', 'rb') as feature:
+                    sql_schema += feature.read()
             self.pgsql_cur.execute(sql_schema)
 
         else:
@@ -2838,7 +2990,7 @@ class pg_engine(object):
         sql_app_name="""SET application_name=%s; """
         self.pgsql_cur.execute(sql_app_name, (app_name , ))
 
-    def write_batch(self, group_insert):
+    def write_batch(self, group_insert, strict=False):
         """
             Main method for adding the batch data in the log tables.
             The row data from group_insert are mogrified in CSV format and stored in
@@ -2900,6 +3052,8 @@ class pg_engine(object):
             """).format(sql.Identifier(log_table))
             self.pgsql_cur.copy_expert(sql_copy,csv_file)
         except psycopg2.Error as e:
+            if strict:
+                raise
             self.logger.error("SQLCODE: %s SQLERROR: %s" % (e.pgcode, e.pgerror))
             self.logger.error("fallback to inserts")
             self.insert_batch(group_insert)

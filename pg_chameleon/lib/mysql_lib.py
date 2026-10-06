@@ -5,7 +5,7 @@ import pymysql
 import codecs
 import binascii
 from pymysqlreplication import BinLogStreamReader
-from pymysqlreplication.event import QueryEvent, GtidEvent, HeartbeatLogEvent
+from pymysqlreplication.event import QueryEvent, GtidEvent, HeartbeatLogEvent, XidEvent
 from pymysqlreplication.row_event import DeleteRowsEvent,UpdateRowsEvent,WriteRowsEvent
 from pymysqlreplication.event import RotateEvent
 from pg_chameleon import sql_token
@@ -50,6 +50,18 @@ class mysql_source(object):
 
             The method checks the function AURORA_VERSION() and if the query doesn't error then skips the log_bin parameter check.
         """
+        if self.source_config.get('transactional_capture'):
+            self.pg_engine.transaction_config_fingerprint()
+            self.cursor_buffered.execute('SELECT @@server_uuid AS source_uuid, @@gtid_mode AS gtid_mode, '
+                                         '@@log_bin AS log_bin, @@binlog_format AS binlog_format, '
+                                         '@@binlog_row_image AS binlog_row_image')
+            config = self.cursor_buffered.fetchone()
+            if (config['gtid_mode'] != 'ON' or not config['log_bin']
+                    or config['binlog_format'] != 'ROW' or config['binlog_row_image'] != 'FULL'):
+                raise ValueError('Transactional migration requires log_bin ON, ROW/FULL and GTID ON')
+            self.source_uuid = config['source_uuid']
+            self.gtid_mode = self.gtid_enable = self.replica_possible = True
+            return
         sql_aurora = """select AURORA_VERSION() ver;"""
         try:
             self.cursor_buffered.execute(sql_aurora)
@@ -907,7 +919,7 @@ class mysql_source(object):
         self.__build_table_exceptions()
         self.__build_skip_events()
         self.__check_mysql_config()
-        if self.gtid_mode:
+        if self.gtid_mode and not self.source_config.get('transactional_capture'):
             master_data = self.get_master_coordinates()
             self.start_xid = master_data[0]["Executed_Gtid_Set"].split(':')[1].split('-')[0]
 
@@ -1217,6 +1229,87 @@ class mysql_source(object):
                     dic_decoded[key] = self.__decode_dic_keys(value)
         return dic_decoded
 
+    def _convert_row_image(self, image, column_map, strict=False):
+        converted = {}
+        for column, value in image.items():
+            if strict:
+                column_type = column_map[column]  # Metadata mismatch must not become text.
+            else:
+                column_type = column_map.get(column, 'text')
+            if column_type in self.hexify and isinstance(value, bytes):
+                value = binascii.hexlify(value).decode()
+            elif column_type == 'json':
+                value = self.__decode_dic_keys(value)
+            elif column_type in self.spatial_datatypes and value:
+                value = self.__get_text_spatial(value)
+            converted[column] = value
+        return converted
+
+    def __read_transaction_stream(self, state):
+        """Yield only complete commits; idle/EOF discards the in-memory tail."""
+        from pg_chameleon.lib.transaction import TransactionBuffer
+        config = self.source_config
+        buffer = TransactionBuffer(config.get('transaction_max_rows', 100000), config.get('transaction_max_bytes', 268435456))
+        table_types = self.get_table_type_map()
+        inconsistent = self.pg_engine.get_inconsistent_tables()
+        self.tables_disabled = self.pg_engine.get_tables_disabled(format='list')
+        log_file = state['capture_file']
+        read_rows = 0
+        stream = BinLogStreamReader(
+            connection_settings=self.replica_conn, server_id=self.my_server_id,
+            only_events=[RotateEvent, DeleteRowsEvent, WriteRowsEvent, UpdateRowsEvent, QueryEvent, GtidEvent, HeartbeatLogEvent, XidEvent],
+            log_file=log_file, log_pos=state['capture_position'], auto_position=state['capture_gtid_set'],
+            resume_stream=True, only_schemas=self.schema_replica, slave_heartbeat=self.sleep_loop)
+        try:
+            for event in stream:
+                if isinstance(event, GtidEvent):
+                    buffer.begin(event.gtid)
+                elif isinstance(event, RotateEvent):
+                    log_file = event.next_binlog
+                elif isinstance(event, HeartbeatLogEvent):
+                    if not buffer.pending:
+                        return
+                elif isinstance(event, (QueryEvent, XidEvent)):
+                    query = event.query.strip().upper() if isinstance(event, QueryEvent) else 'COMMIT'
+                    if query == 'BEGIN':
+                        if not buffer.pending:
+                            raise ValueError('Anonymous transaction in GTID migration')
+                        continue
+                    if query == 'ROLLBACK':
+                        buffer.rollback()
+                        continue
+                    if query != 'COMMIT':
+                        raise ValueError('DDL/statement event during transactional migration')
+                    transaction = buffer.commit({'File': log_file, 'Position': event.packet.log_pos, 'Time': event.timestamp})
+                    read_rows += len(transaction['rows'])
+                    yield transaction
+                    if read_rows >= self.replica_batch_size:
+                        return
+                elif isinstance(event, (WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent)):
+                    if not buffer.pending:
+                        raise ValueError('Row event without GTID')
+                    schema, table = event.schema, event.table
+                    if schema not in self.schema_mappings or not self.__store_binlog_event(table, schema):
+                        continue
+                    skip, action = self.__skip_event(table, schema, event)
+                    if skip:
+                        continue
+                    destination = self.schema_mappings[schema]
+                    point = inconsistent.get(destination + '.' + table)
+                    if point and (int(log_file.rsplit('.', 1)[1]), event.packet.log_pos) < (point['log_seq'], point['log_pos']):
+                        continue
+                    column_map = table_types[schema][table]['column_type']
+                    for row in event.rows:
+                        after = row['after_values'] if action == 'update' else row['values']
+                        before = row['before_values'] if action == 'update' else {}
+                        buffer.append({'global_data': {'binlog': log_file, 'logpos': event.packet.log_pos,
+                                                       'schema': destination, 'table': table, 'action': action,
+                                                       'event_time': event.timestamp, 'consistent_table': bool(point)},
+                                       'event_after': self._convert_row_image(after, column_map, strict=True),
+                                       'event_before': self._convert_row_image(before, column_map, strict=True)})
+        finally:
+            stream.close()
+
     def __read_replica_stream(self, batch_data):
         """
         Stream the replica using the batch data. This method evaluates the different events streamed from MySQL
@@ -1437,36 +1530,8 @@ class mysql_source(object):
                                 global_data["action"] = "insert"
                                 event_after=row["values"]
 
-                            for column_name in event_after:
-                                try:
-                                    column_type=column_map[column_name]
-                                except KeyError:
-                                    self.logger.debug("Detected inconsistent structure for the table  %s. The replay may fail. " % (table_name))
-                                    column_type = 'text'
-                                if column_type in self.hexify and event_after[column_name]:
-                                    event_after[column_name]=binascii.hexlify(event_after[column_name]).decode()
-                                elif column_type in self.hexify and isinstance(event_after[column_name], bytes):
-                                    event_after[column_name] = ''
-                                elif column_type == 'json':
-                                    event_after[column_name] = self.__decode_dic_keys(event_after[column_name])
-                                elif column_type in self.spatial_datatypes and event_after[column_name]:
-                                    event_after[column_name] = self.__get_text_spatial(event_after[column_name])
-
-
-                            for column_name in event_before:
-                                try:
-                                    column_type=column_map[column_name]
-                                except KeyError:
-                                    self.logger.debug("Detected inconsistent structure for the table  %s. The replay may fail. " % (table_name))
-                                    column_type = 'text'
-                                if column_type in self.hexify and event_before[column_name]:
-                                    event_before[column_name]=binascii.hexlify(event_before[column_name]).decode()
-                                elif column_type in self.hexify and isinstance(event_before[column_name], bytes):
-                                    event_before[column_name] = ''
-                                elif column_type == 'json':
-                                    event_before[column_name] = self.__decode_dic_keys(event_after[column_name])
-                                elif column_type in self.spatial_datatypes and event_after[column_name]:
-                                    event_before[column_name] = self.__get_text_spatial(event_before[column_name])
+                            event_after = self._convert_row_image(event_after, column_map)
+                            event_before = self._convert_row_image(event_before, column_map)
                             event_insert={"global_data":global_data,"event_after":event_after,  "event_before":event_before}
                             size_insert += len(str(event_insert))
                             group_insert.append(event_insert)
@@ -1520,6 +1585,27 @@ class mysql_source(object):
                 self.pg_engine.set_read_paused(True)
             else:
                 self.pg_engine.set_read_paused(False)
+                if self.source_config.get('transactional_capture'):
+                    from pymysqlreplication.gtid import GtidSet
+                    state = self.pg_engine.get_transaction_state()
+                    if state['source_uuid'] != self.source_uuid:
+                        raise ValueError('Source server UUID changed')
+                    self.cursor_buffered.execute('SELECT @@gtid_purged AS purged, @@gtid_executed AS executed')
+                    available = self.cursor_buffered.fetchone()
+                    captured = GtidSet(state['capture_gtid_set'])
+                    if any(gtid not in captured for gtid in GtidSet(available['purged']).gtids):
+                        raise ValueError('Uncaptured source GTIDs have been purged')
+                    executed = GtidSet(available['executed'])
+                    if any(gtid not in executed for gtid in captured.gtids):
+                        raise ValueError('Source no longer contains the captured GTID frontier')
+                    try:
+                        for transaction in self.__read_transaction_stream(state):
+                            self.pg_engine.publish_transaction(self.source_uuid, transaction)
+                        self.pg_engine.keep_existing_schema = self.keep_existing_schema
+                        self.pg_engine.check_source_consistent()
+                    finally:
+                        self.disconnect_db_buffered()
+                    return
                 batch_data = self.pg_engine.get_batch_data()
                 if len(batch_data)>0:
                     id_batch=batch_data[0][0]
@@ -1558,6 +1644,8 @@ class mysql_source(object):
         self.logger.debug("starting init replica for source %s" % self.source)
         self.__init_sync()
         self.__check_mysql_config()
+        if self.source_config.get('transactional_capture'):
+            self.pg_engine.assert_new_transaction_source()
         master_start = self.get_master_coordinates()
         self.pg_engine.set_source_status("initialising")
         self.pg_engine.cleanup_source_tables()
@@ -1580,6 +1668,8 @@ class mysql_source(object):
                 self.drop_loading_schemas()
             self.pg_engine.clean_batch_data()
             self.pg_engine.save_master_status(master_start)
+            if self.source_config.get('transactional_capture'):
+                self.pg_engine.bootstrap_transaction_state(self.source_uuid, master_start[0])
             self.pg_engine.set_source_status("initialised")
             self.connect_db_buffered()
             master_end = self.get_master_coordinates()

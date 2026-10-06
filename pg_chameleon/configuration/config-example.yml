@@ -56,7 +56,13 @@ sources:
     on_error_replay: continue
     on_error_read: continue
     auto_maintenance: "disabled"
-    gtid_enable: false
+        gtid_enable: false
+        # Opt-in only for a NEW catalogue/initial load; never upgrade a running source.
+        # When enabled: gtid_enable=true, on_error_read/replay=exit,
+        # auto_maintenance=disabled; no DDL while migration is active.
+        transactional_capture: false
+        transaction_max_rows: 100000
+        transaction_max_bytes: 268435456
     type: mysql
     skip_events:
       insert:
