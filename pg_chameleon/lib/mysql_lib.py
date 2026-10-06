@@ -515,7 +515,8 @@ class mysql_source(object):
 
                 END
                 AS select_stat,
-                column_name as column_name
+                column_name as column_name,
+                data_type as data_type
             FROM
                 information_schema.COLUMNS
             WHERE
@@ -527,6 +528,20 @@ class mysql_source(object):
         """
         self.cursor_buffered.execute(sql_select, (schema, table))
         select_data = self.cursor_buffered.fetchall()
+        if self.source_config.get('transactional_capture'):
+            expressions = []
+            for statement in select_data:
+                expression = statement['select_csv']
+                if statement['data_type'] in self.hexify:
+                    column = statement['column_name'].replace('`', '``')
+                    expression = "CONCAT(CHAR(92),'x',HEX(`%s`))" % column
+                expressions.append(expression)
+            # Only SQL NULL is unquoted; literal text "NULL" remains real data.
+            quoted = ["IF({0} IS NULL,'NULL',CONCAT(CHAR(34),REPLACE({0},CHAR(34),CONCAT(CHAR(34),CHAR(34))),CHAR(34)))".format(expr)
+                      for expr in expressions]
+            return {'select_csv': "CONCAT_WS(',',%s)" % ','.join(quoted),
+                    'select_stat': ','.join(expressions),
+                    'column_list': ','.join('"%s"' % row['column_name'].replace('"', '""') for row in select_data)}
         select_csv = ["COALESCE(REPLACE(%s, '\"', '\"\"'),'NULL') " % statement["select_csv"] for statement in select_data]
         select_stat = [statement["select_csv"] for statement in select_data]
         column_list = ['"%s"' % statement["column_name"] for statement in select_data]
@@ -681,6 +696,13 @@ class mysql_source(object):
             try:
                 self.pg_engine.copy_data(csv_file, loading_schema, table, column_list)
             except:
+                if self.source_config.get('transactional_capture'):
+                    csv_file.close()
+                    if table_txs:
+                        self.end_tx()
+                    else:
+                        self.unlock_tables()
+                    raise
                 self.logger.info("Table %s.%s error in PostgreSQL copy, saving slice number for the fallback to insert statements " %  (loading_schema, table ))
                 slice_insert.append(slice)
 
@@ -1238,6 +1260,8 @@ class mysql_source(object):
                 column_type = column_map.get(column, 'text')
             if column_type in self.hexify and isinstance(value, bytes):
                 value = binascii.hexlify(value).decode()
+                if strict:
+                    value = '\\x' + value
             elif column_type == 'json':
                 value = self.__decode_dic_keys(value)
             elif column_type in self.spatial_datatypes and value:
@@ -1267,8 +1291,9 @@ class mysql_source(object):
                 elif isinstance(event, RotateEvent):
                     log_file = event.next_binlog
                 elif isinstance(event, HeartbeatLogEvent):
-                    if not buffer.pending:
-                        return
+                    # GTID auto-position sends an initial heartbeat BEFORE backlog.
+                    # The non-blocking stream's EOF, not heartbeat, means idle.
+                    continue
                 elif isinstance(event, (QueryEvent, XidEvent)):
                     query = event.query.strip().upper() if isinstance(event, QueryEvent) else 'COMMIT'
                     if query == 'BEGIN':

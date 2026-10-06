@@ -726,6 +726,7 @@ class pg_engine(object):
         return hashlib.sha256(json.dumps(selection, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
     def get_transaction_state(self):
+        self.set_source_id()
         fingerprint = self.transaction_config_fingerprint()
         self.pgsql_cur.execute('SELECT version FROM sch_chameleon.v_betark_transactional_version')
         if self.pgsql_cur.fetchone() != (1,):
@@ -740,6 +741,7 @@ class pg_engine(object):
         return state
 
     def check_transaction_mode(self):
+        self.set_source_id()
         if self.transactional_capture():
             return self.get_transaction_state()
         self.pgsql_cur.execute("SELECT to_regclass('sch_chameleon.t_transaction_state')")
@@ -752,6 +754,7 @@ class pg_engine(object):
         """Only called after a successful new initial load; never from reader restart."""
         from pymysqlreplication.gtid import GtidSet
         from uuid import UUID
+        self.set_source_id()
         fingerprint = self.transaction_config_fingerprint()
         source_uuid = str(UUID(source_uuid))
         captured = str(GtidSet(coordinates['Executed_Gtid_Set']))
@@ -789,6 +792,7 @@ class pg_engine(object):
                 connection.autocommit = True
 
     def assert_new_transaction_source(self):
+        self.set_source_id()
         self.transaction_config_fingerprint()
         self.pgsql_cur.execute('SELECT enm_status FROM sch_chameleon.t_sources WHERE i_id_source=%s', (self.i_id_source,))
         if self.pgsql_cur.fetchone() != ('ready',):
@@ -805,6 +809,7 @@ class pg_engine(object):
         from pymysqlreplication.gtid import Gtid, GtidSet
         from pg_chameleon.lib.transaction import TransactionBuffer, merge_committed_gtid
         from uuid import UUID
+        self.set_source_id()
         source_uuid = str(UUID(source_uuid))
         config = self.sources[self.source]
         buffer = TransactionBuffer(config.get('transaction_max_rows', 100000), config.get('transaction_max_bytes', 268435456))

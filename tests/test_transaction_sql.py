@@ -136,6 +136,16 @@ class PublicationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.engine.assert_new_transaction_source()
 
+    def test_source_id_is_resolved_on_fresh_cli_engine(self):
+        saved = self.engine.i_id_source
+        del self.engine.i_id_source
+        try:
+            with self.assertRaises(ValueError):
+                self.engine.assert_new_transaction_source()
+            self.assertEqual(self.engine.get_transaction_state()['i_id_source'], saved)
+        finally:
+            self.engine.i_id_source = saved
+
     def test_two_publishers_deliver_once(self):
         def publish():
             engine = make_engine(self.dsn)
@@ -233,6 +243,18 @@ class PublicationTest(unittest.TestCase):
         self.assertTrue(all(not status[1] for status in statuses))
         self.assertEqual(self.count(), 1001)
         self.assertEqual(self.queue(), [])
+
+    def test_missing_old_row_does_not_acknowledge_update(self):
+        tx = self.transaction(rows=1)
+        tx['rows'][0]['global_data']['action'] = 'update'
+        tx['rows'][0]['event_before'] = {'id': 99}
+        tx['rows'][0]['event_after'] = {'id': 100}
+        self.engine.publish_transaction(SID, tx)
+        before = self.engine.get_transaction_state()
+        queued = self.queue()
+        self.assertTrue(self.replay()[1], 'UPDATE of missing row must fail closed')
+        self.assertEqual(self.engine.get_transaction_state(), before)
+        self.assertEqual(self.queue(), queued)
 
     def test_migration_replay_forbids_skip_errors(self):
         with self.assertRaises(psycopg2.Error):

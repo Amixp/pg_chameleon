@@ -307,8 +307,16 @@ $BODY$
         v_i_evt_queue   bigint[];
         v_ts_evt_source   timestamp without time zone;
         v_tab_enabled   boolean;
+        v_transactional boolean := false;
+        v_row_event sch_chameleon.t_log_replica%ROWTYPE;
+        v_move boolean;
+        v_affected bigint;
 
     BEGIN
+        IF to_regclass('sch_chameleon.t_transaction_state') IS NOT NULL THEN
+            SELECT EXISTS(SELECT 1 FROM sch_chameleon.t_transaction_state WHERE i_id_source=p_i_id_source)
+                INTO v_transactional;
+        END IF;
         v_i_replayed:=0;
         v_i_ddl:=0;
         v_i_skipped:=0;
@@ -538,7 +546,50 @@ $BODY$
         LOOP
 
             BEGIN
-                EXECUTE v_r_statements.t_sql;
+                v_move := false;
+                IF v_transactional AND v_r_statements.enm_binlog_event='update' THEN
+                    SELECT * INTO STRICT v_row_event FROM sch_chameleon.t_log_replica
+                        WHERE i_id_event=v_r_statements.i_id_event AND i_id_batch=v_i_id_batch;
+                    IF coalesce(v_row_event.jsb_event_before,'{}'::jsonb)='{}'::jsonb
+                        OR coalesce(v_row_event.jsb_event_after,'{}'::jsonb)='{}'::jsonb THEN
+                        RAISE EXCEPTION 'Transactional UPDATE requires FULL before/after images';
+                    END IF;
+                    -- Use actual Timescale dimensions, not Zabbix table-name guesses.
+                    IF to_regclass('timescaledb_information.dimensions') IS NOT NULL THEN
+                        IF EXISTS(SELECT 1 FROM timescaledb_information.dimensions d
+                            WHERE d.hypertable_schema=v_r_statements.v_schema_name
+                              AND d.hypertable_name=v_r_statements.v_table_name
+                              AND (NOT v_row_event.jsb_event_before ? d.column_name
+                                   OR NOT v_row_event.jsb_event_after ? d.column_name)) THEN
+                            RAISE EXCEPTION 'Missing hypertable partition dimension in FULL images';
+                        END IF;
+                        SELECT coalesce(bool_or(v_row_event.jsb_event_before->d.column_name
+                            IS DISTINCT FROM v_row_event.jsb_event_after->d.column_name),false)
+                            INTO v_move FROM timescaledb_information.dimensions d
+                            WHERE d.hypertable_schema=v_r_statements.v_schema_name
+                              AND d.hypertable_name=v_r_statements.v_table_name;
+                    END IF;
+                END IF;
+                IF v_move THEN
+                    EXECUTE format('DELETE FROM %I.%I WHERE %s',v_r_statements.v_schema_name,
+                                   v_r_statements.v_table_name,v_r_statements.t_pk_data);
+                    GET DIAGNOSTICS v_affected=ROW_COUNT;
+                    IF v_affected<>1 THEN
+                        RAISE EXCEPTION 'CDC old row missing or divergent: % rows',v_affected;
+                    END IF;
+                    -- Native typed conversion includes raw bytea, JSON and numeric values.
+                    EXECUTE format('INSERT INTO %I.%I SELECT (jsonb_populate_record(NULL::%I.%I,$1)).*',
+                                   v_r_statements.v_schema_name,v_r_statements.v_table_name,
+                                   v_r_statements.v_schema_name,v_r_statements.v_table_name)
+                        USING v_row_event.jsb_event_after;
+                    GET DIAGNOSTICS v_affected=ROW_COUNT;
+                ELSE
+                    EXECUTE v_r_statements.t_sql;
+                    GET DIAGNOSTICS v_affected=ROW_COUNT;
+                END IF;
+                IF v_transactional AND v_affected<>1 THEN
+                    RAISE EXCEPTION 'Transactional DML expected one row, affected %',v_affected;
+                END IF;
                 v_i_ddl:=v_i_ddl+v_r_statements.i_ddl;
                 v_i_replayed:=v_i_replayed+v_r_statements.i_replay;
 

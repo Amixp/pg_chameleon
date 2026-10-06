@@ -133,6 +133,11 @@ class ReaderTest(unittest.TestCase):
         tx = self.stream([self.gtid(), self.rows(), self.event(XidEvent), self.gtid(10), self.rows(), self.event(XidEvent, position=300)])
         self.assertEqual([t['gtid'] for t in tx], [SID + ':9', SID + ':10'])
 
+    def test_initial_heartbeat_does_not_hide_following_gtids(self):
+        tx = self.stream([self.event(RotateEvent, next_binlog='mysql-bin.000001'),
+                          self.event(HeartbeatLogEvent), self.gtid(), self.rows(), self.event(XidEvent)])
+        self.assertEqual(len(tx), 1)
+
     def test_filtered_and_rollback(self):
         self.source.skip_tables = {'source': ['items']}
         tx = self.stream([self.gtid(), self.rows(), self.event(XidEvent)])
@@ -153,6 +158,42 @@ class ReaderTest(unittest.TestCase):
         tx = self.stream([self.gtid(), event, self.event(XidEvent)])
         self.assertEqual(tx[0]['rows'][0]['event_before']['j'], {'k': 'old'})
         self.assertEqual(tx[0]['rows'][0]['event_after']['j'], {'k': 'new'})
+
+    def test_native_bytea_keeps_null_empty_and_actual_bytes(self):
+        for value in (None, b'', b'\x00\xff', b'0102', b'\x01\x02'):
+            result = self.source._convert_row_image({'payload': value}, {'payload': 'blob'}, strict=True)
+            self.assertEqual(result['payload'], None if value is None else '\\x' + value.hex())
+        self.assertEqual(self.source._convert_row_image({'payload': b'\x01\x02'}, {'payload': 'blob'})['payload'], '0102')
+
+    def test_copy_uses_native_bytea_and_quotes_literal_null(self):
+        self.source.charset = 'utf8mb4'
+        self.source.cursor_buffered = mock.Mock()
+        self.source.cursor_buffered.fetchall.return_value = [
+            {'select_csv': 'hex(payload)', 'select_stat': 'hex(payload) AS payload', 'column_name': 'payload', 'data_type': 'blob'},
+            {'select_csv': 'label', 'select_stat': 'label', 'column_name': 'label', 'data_type': 'varchar'}]
+        statements = self.source.generate_select_statements('source', 'items')
+        self.assertIn('CHAR(92)', statements['select_csv'])
+        self.assertNotIn('\'"NULL"\'', statements['select_csv'])
+
+    def test_initial_copy_failure_never_falls_back(self):
+        source = self.source
+        source.logger = mock.Mock()
+        source.schema_loading = {'source': {'loading': 'public'}}
+        source.copy_max_memory = 1024
+        source.copy_mode = 'direct'
+        source.out_dir = '/unused'
+        source.cursor_buffered = mock.Mock()
+        source.cursor_buffered.fetchone.return_value = {'table_rows': 1, 'copy_limit': 1, 'transactions': 'YES'}
+        source.cursor_unbuffered = mock.Mock()
+        source.cursor_unbuffered.fetchmany.side_effect = [[('x',)], []]
+        for name in ('connect_db_buffered', 'connect_db_unbuffered', 'lock_table', 'unlock_tables', 'begin_tx', 'end_tx', 'print_progress', 'insert_table_data'):
+            setattr(source, name, mock.Mock())
+        source.get_master_coordinates = lambda: [COMMIT]
+        source.generate_select_statements = lambda *_: {'select_csv': 'id', 'select_stat': 'id', 'column_list': 'id'}
+        source.pg_engine.copy_data.side_effect = RuntimeError('Synthetic COPY failure')
+        with self.assertRaisesRegex(RuntimeError, 'Synthetic COPY failure'):
+            source.copy_data('source', 'items')
+        source.insert_table_data.assert_not_called()
 
     def test_source_row_full_gtid_required(self):
         good = {'source_uuid': SID, 'gtid_mode': 'ON', 'log_bin': 1, 'binlog_format': 'ROW', 'binlog_row_image': 'FULL'}

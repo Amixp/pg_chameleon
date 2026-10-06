@@ -1,5 +1,21 @@
 # Изменения Betark
 
+## 2026-10-07 — native Timescale/bytea gate (candidate, не release)
+
+- COPY/CDC сохраняют SQL NULL, empty bytea, NUL/0xff и реальные bytes, включая
+  отличие ASCII `0102` от `0x0102`. Literal text `NULL` больше не становится NULL.
+- Initial COPY error немедленно останавливает load; fallback/discard запрещён.
+- Source ID разрешается до guard/frontier entrypoints; CLI lifecycle проверен.
+- Начальный GTID heartbeat не скрывает backlog; non-blocking EOF определяет idle.
+- Native replay определяет реальные partition dimensions Timescale и переносит
+  FULL images через DELETE ровно одной old row и typed INSERT, атомарно.
+  Missing old row и неверное число затронутых строк не подтверждаются.
+- Candidate gate на PostgreSQL 16/TimescaleDB 2.14.2 прошёл без test-only SQL
+  adapters: девять chunk moves, COPY/CDC binary, rollback/resume, failed move
+  retry, failed batch retry, source transaction 1001 rows rollback/retry.
+- Fixture-only read-only binlog probe сохранён в tests/probe-transaction-stream.py.
+- Crash/HA, hashed wheel/release и полный 203-table rehearsal ещё не допущены.
+
 ## 2026-10-07 — атомарный replay source transaction (не release)
 
 - Native replay wrapper переиспользует upstream SQL generator, но применяет
