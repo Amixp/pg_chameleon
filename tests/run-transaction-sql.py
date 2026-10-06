@@ -46,7 +46,9 @@ def main():
             path.write_text(dsn)
             path.chmod(0o600)
             env = dict(os.environ, CDC_TEST_DSN_FILE=str(path))
-            return subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests',
+            # -I prevents the checkout cwd from shadowing an installed release wheel.
+            env['CDC_TEST_FORBID_SOURCE_PATH'] = env.get('CDC_TEST_FORBID_SOURCE_PATH', '')
+            return subprocess.run([sys.executable, '-I', '-m', 'unittest', 'discover', '-s', 'tests',
                                    '-p', 'test_transaction*.py', '-v'], env=env).returncode
     finally:
         subprocess.run(['podman', 'stop', name], check=True, stdout=subprocess.DEVNULL)

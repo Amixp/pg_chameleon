@@ -6,11 +6,11 @@ def readme():
     with open('README.rst') as f:
         return f.read()
 
-package_data = {'pg_chameleon': ['configuration/config-example.yml','sql/upgrade/*.sql','sql/drop_schema.sql','sql/create_schema.sql', 'LICENSE.txt']}
+package_data = {'pg_chameleon': ['configuration/config-example.yml','sql/upgrade/*.sql','sql/drop_schema.sql','sql/create_schema.sql', 'sql/betark_transactional.sql', 'LICENSE.txt']}
 
 setuptools.setup(
      name="pg_chameleon",
-     version="2.0.21",
+     version="2.0.21+betark.1",
      description="MySQL to PostgreSQL replica and migration",
     long_description=readme(),
     author = "Federico Campoli",
@@ -19,6 +19,7 @@ setuptools.setup(
     maintainer_email = "thedoctor@pgdba.org",
     url="https://codeberg.org/the4thdoctor/pg_chameleon",
     license="BSD License",
+    license_files=['LICENSE.txt'],
     platforms=[
         "linux"
     ],
@@ -56,7 +57,9 @@ setuptools.setup(
         'daemonize>=2.4.7',
         'rollbar>=0.13.17',
         'parsy>=2.1',
-        'Sphinx>=7.4.7'
+        'Sphinx>=7.4.7',
+        # global_lib imports pkg_resources; removed in setuptools 81.
+        'setuptools<81'
 
     ],
     include_package_data = True,

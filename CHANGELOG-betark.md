@@ -1,5 +1,17 @@
 # Изменения Betark
 
+## 2026-10-07 — packaging candidate 2.0.21+betark.1
+
+- Distribution version отделена от base catalogue 2.0.10/feature 1.
+- Wheel включает packaged feature SQL и исходный BSD LICENSE.txt.
+- Явно сохранена dependency setuptools<81 для существующего pkg_resources;
+  остальные upstream dependencies, включая Sphinx, не удалялись.
+- Build/runtime dependency locks фиксируют реальные версии/SHA256.
+- Native SQL runner использует -I: checkout не подменяет установленный wheel.
+  Wheel admission дополнительно отвергает import из source checkout.
+- Build/wheel native/crash gate, publication/download и full/HA admission
+  пока не выполнены; номер версии не является подтверждением release.
+
 ## 2026-10-07 — crash/restart и потеря commit response (candidate)
 
 - Сохранены реальные PG16 тесты остановки только собственного worker до/после

@@ -4,6 +4,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import re
+import sys
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -97,6 +98,9 @@ def replay_worker(dsn, source_id, pipe):
 class PublicationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        forbidden = os.environ.get('CDC_TEST_FORBID_SOURCE_PATH')
+        if forbidden and Path(sys.modules[pg_engine.__module__].__file__).resolve().is_relative_to(Path(forbidden).resolve()):
+            raise ValueError('Wheel admission imported the source checkout instead of the installed release')
         path = Path(os.environ['CDC_TEST_DSN_FILE'])
         if path.stat().st_mode & 0o077:
             raise ValueError('DSN file must be private')
